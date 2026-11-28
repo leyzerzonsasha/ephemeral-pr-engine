@@ -1,0 +1,76 @@
+name: PR Preview Down
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  destroy-preview:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Check if PR state exists
+        id: state_check
+        run: |
+          if aws s3api head-object \
+            --bucket "${TFSTATE_BUCKET}" \
+            --key "previews/pr-${PR_NUMBER}.tfstate" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No preview state found for PR #${PR_NUMBER}; nothing to destroy."
+          fi
+
+      - name: Setup Terraform
+        if: steps.state_check.outputs.exists == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.2"
+
+      - name: Terraform Destroy & Clean Up State File
+        if: steps.state_check.outputs.exists == 'true'
+        working-directory: infra/preview
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="key=previews/pr-${PR_NUMBER}.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+          terraform destroy -auto-approve -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="tfstate_bucket=${TFSTATE_BUCKET}" \
+            -var="pr_number=${PR_NUMBER}" \
+            -var="image_uri=unused" \
+            -var="git_sha=unused"
+
+          aws s3 rm "s3://${TFSTATE_BUCKET}/previews/pr-${PR_NUMBER}.tfstate"
+
+      - name: Comment teardown confirmation on PR
+        if: steps.state_check.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "Ephemeral preview environment for PR #${PR_NUMBER} has been destroyed and its Terraform state removed."
