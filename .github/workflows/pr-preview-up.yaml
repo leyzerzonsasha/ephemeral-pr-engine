@@ -1,0 +1,110 @@
+name: PR Preview Up
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-preview:
+    # Security guard: prevent untrusted fork PRs from assuming AWS OIDC role
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      SHORT_SHA: ${{ github.event.pull_request.head.sha }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      TFSTATE_BUCKET: ${{ vars.TFSTATE_BUCKET }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push immutable image
+        id: build
+        run: |
+          SHORT="${SHORT_SHA:0:7}"
+          IMAGE_TAG="pr-${PR_NUMBER}-${SHORT}"
+          IMAGE_URI="${{ steps.ecr.outputs.registry }}/ephemeral-pr-app:${IMAGE_TAG}"
+
+          if aws ecr describe-images \
+            --repository-name ephemeral-pr-app \
+            --image-ids imageTag="${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE_TAG} already exists in ECR; skipping build."
+          else
+            docker build -t "${IMAGE_URI}" ./sample-app
+            docker push "${IMAGE_URI}"
+          fi
+
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.17.2"
+
+      - name: Terraform Init & Apply (Per-PR State)
+        id: tf
+        working-directory: infra/preview
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${TFSTATE_BUCKET}" \
+            -backend-config="key=previews/pr-${PR_NUMBER}.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+          terraform apply -auto-approve -input=false \
+            -var="aws_region=${AWS_REGION}" \
+            -var="tfstate_bucket=${TFSTATE_BUCKET}" \
+            -var="pr_number=${PR_NUMBER}" \
+            -var="image_uri=${{ steps.build.outputs.image_uri }}" \
+            -var="git_sha=${{ steps.build.outputs.short_sha }}"
+
+          echo "preview_url=$(terraform output -raw preview_url)" >> "$GITHUB_OUTPUT"
+          echo "healthcheck_url=$(terraform output -raw healthcheck_url)" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test preview endpoint
+        run: |
+          URL="${{ steps.tf.outputs.healthcheck_url }}"
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /tmp/health.json -w "%{http_code}" "$URL" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed: $(cat /tmp/health.json)"
+              exit 0
+            fi
+            echo "Attempt $i/12 returned HTTP $STATUS; retrying in 10s..."
+            sleep 10
+          done
+          echo "Preview failed health check at $URL"
+          exit 1
+
+      - name: Comment preview URL on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+          ### Ephemeral Preview Ready
+          - **Preview URL:** ${{ steps.tf.outputs.preview_url }}
+          - **Health Check:** ${{ steps.tf.outputs.healthcheck_url }}
+          - **Commit:** \`${{ steps.build.outputs.short_sha }}\`
+          - **State Key:** \`previews/pr-${PR_NUMBER}.tfstate\`
+          EOF
+          )"
